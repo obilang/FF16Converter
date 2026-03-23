@@ -72,6 +72,11 @@ namespace AvaloniaToolbox.Core.Textures
 
         public byte[] Decode(byte[] input, uint width, uint height)
         {
+            // Prefer the native image_dds decoder (same as Encode) — the BCnEncoder
+            // software decoder outputs A=0 for BC7, producing a fully-transparent image.
+            if (ImageDds.CanUse())
+                return DecodeWithImageDds(input, width, height);
+
             BcDecoder decoder = new BcDecoder();
             decoder.InputOptions.DdsBc1ExpectAlpha = this.UseBc1Alpha;
             decoder.OutputOptions.Bc4Component = ColorComponent.Luminance;
@@ -97,13 +102,75 @@ namespace AvaloniaToolbox.Core.Textures
             for (int i = 0; i < colors.Length; i++)
             {
                 int offset = i * 4;
-
                 output[offset + 0] = colors[i].r;
                 output[offset + 1] = colors[i].g;
                 output[offset + 2] = colors[i].b;
                 output[offset + 3] = colors[i].a;
             }
             return output;
+        }
+
+        // Native decoder via image_dds — mirrors EncodeWithImageDds
+        public byte[] DecodeWithImageDds(byte[] input, uint width, uint height)
+        {
+            ImageDds.ImageFormat format = ImageDds.ImageFormat.BC1RgbaUnorm;
+
+            switch (Format)
+            {
+                case BcnFormats.BC1: format = ImageDds.ImageFormat.BC1RgbaUnorm; break;
+                case BcnFormats.BC2: format = ImageDds.ImageFormat.BC2RgbaUnorm; break;
+                case BcnFormats.BC3: format = ImageDds.ImageFormat.BC3RgbaUnorm; break;
+                case BcnFormats.BC4: format = ImageDds.ImageFormat.BC4RUnorm;    break;
+                case BcnFormats.BC5: format = ImageDds.ImageFormat.BC5RgUnorm;   break;
+                case BcnFormats.BC6: format = ImageDds.ImageFormat.BC6hRgbUfloat; break;
+                case BcnFormats.BC7: format = IsSRGB
+                    ? ImageDds.ImageFormat.BC7RgbaUnormSrgb
+                    : ImageDds.ImageFormat.BC7RgbaUnorm; break;
+            }
+            if (IsSigned)
+            {
+                switch (Format)
+                {
+                    case BcnFormats.BC4: format = ImageDds.ImageFormat.BC4RSnorm;     break;
+                    case BcnFormats.BC5: format = ImageDds.ImageFormat.BC5RgSnorm;    break;
+                    case BcnFormats.BC6: format = ImageDds.ImageFormat.BC6hRgbSfloat; break;
+                }
+            }
+
+            // Call the native function directly — do NOT pass through ImageDds.Decode()
+            // because that method calls ImageToMultiple4() which treats the input as RGBA
+            // pixels and corrupts block-compressed data.
+            return DecodeNative(input, width, height, format);
+        }
+
+        private static unsafe byte[] DecodeNative(byte[] input, uint width, uint height, ImageDds.ImageFormat format)
+        {
+            IntPtr decodedDataPtr = IntPtr.Zero;
+            ulong decodedLen;
+            try
+            {
+                fixed (byte* src = &input[0])
+                {
+                    uint result = ImageDdsNative.decode_bytes_x64(
+                        width, height,
+                        src, (ulong)input.Length,
+                        (uint)format,
+                        out decodedDataPtr,
+                        out decodedLen);
+
+                    if ((ImageDds.SurfaceErrorCode)result != ImageDds.SurfaceErrorCode.Success)
+                        throw new Exception($"[image_dds decode] {(ImageDds.SurfaceErrorCode)result}");
+
+                    byte[] decoded = new byte[decodedLen];
+                    Marshal.Copy(decodedDataPtr, decoded, 0, (int)decodedLen);
+                    return decoded;
+                }
+            }
+            finally
+            {
+                if (decodedDataPtr != IntPtr.Zero)
+                    ImageDdsNative.free_decoded_data(decodedDataPtr);
+            }
         }
 
         public byte[] Encode(byte[] input, uint width, uint height)

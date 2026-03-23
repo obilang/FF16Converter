@@ -101,6 +101,17 @@ namespace FinalFantasy16
                 set => Flags = (uint)BitUtils.SetBits((int)Flags, (int)value, 8, 24);
             }
 
+            /// <summary>
+            /// True when this texture is a Texture2DArray, detected by Depth > 1.
+            /// (Dimension bits 0-1: 0=1D, 1=2D, 2=Volume/3D, 3=2DArray — but Depth > 1 is the reliable signal)
+            /// </summary>
+            public bool IsTextureArray => Depth > 1;
+
+            /// <summary>
+            /// Number of array slices. For Texture2DArray this is the Depth field; otherwise 1.
+            /// </summary>
+            public int ArrayCount => IsTextureArray ? (int)Depth : 1;
+
             public Texture()
             {
                 this.Dimension = 1;
@@ -113,41 +124,74 @@ namespace FinalFantasy16
             public byte[] GetImageData()
             {
                 byte[] decomp = ByteUtil.CombineByteArray(Chunks.Select(x => x.DecompressedBuffer).ToArray());
-                return TextureDataUtil.CalculateSurfacePadding(this, decomp);
+                // Pass-through: raw chunk data is already in the aligned mip-major layout
+                return TextureDataUtil.CalculateSurfacePadding(this, decomp, ArrayCount);
             }
 
             public void SetImageData(List<byte[]> mipmap_list)
             {
                 Chunks.Clear();
-                Chunks.Add(new Chunk()
+                // mipmap_list is in slice-major order:
+                //   [slice0_mip0, slice0_mip1, ..., slice1_mip0, slice1_mip1, ...]
+                // Store everything as a single chunk (or two chunks: mip0 subresources + rest).
+                int arrayCount = ArrayCount;
+                int subresourcesPerSlice = mipmap_list.Count / arrayCount;
+
+                if (subresourcesPerSlice <= 1 || mipmap_list.Count == arrayCount)
                 {
-                    DecompressedBuffer = mipmap_list[0], //base level image
-                    ChunkType = mipmap_list.Count == 1 ? 1u : 0u, //todo what does this flag do
-                });
-                //Mip data stored in second chunk
-                if (mipmap_list.Count > 1)
-                {
-                    var mipData = ByteUtil.CombineByteArray(mipmap_list.Skip(1).ToArray());
+                    // Only mip0 present (one subresource per slice)
+                    byte[] allData = ByteUtil.CombineByteArray(mipmap_list.ToArray());
                     Chunks.Add(new Chunk()
                     {
-                        DecompressedBuffer = mipData,
+                        DecompressedBuffer = allData,
+                        ChunkType = 1u,
+                    });
+                }
+                else
+                {
+                    // Chunk 0: mip0 for every slice  (slice0_mip0, slice1_mip0, ...)
+                    // Chunk 1: remaining mips for every slice (slice0_mip1..mipN, slice1_mip1..mipN, ...)
+                    var mip0Buffers   = new List<byte[]>();
+                    var restBuffers   = new List<byte[]>();
+                    for (int s = 0; s < arrayCount; s++)
+                    {
+                        int baseIdx = s * subresourcesPerSlice;
+                        mip0Buffers.Add(mipmap_list[baseIdx]);
+                        for (int m = 1; m < subresourcesPerSlice; m++)
+                            restBuffers.Add(mipmap_list[baseIdx + m]);
+                    }
+                    Chunks.Add(new Chunk()
+                    {
+                        DecompressedBuffer = ByteUtil.CombineByteArray(mip0Buffers.ToArray()),
+                        ChunkType = 0u,
+                    });
+                    Chunks.Add(new Chunk()
+                    {
+                        DecompressedBuffer = ByteUtil.CombineByteArray(restBuffers.ToArray()),
                         ChunkIndex = 1,
-                        ChunkType = 1, //todo what does this flag do
+                        ChunkType = 1u,
                     });
                 }
             }
 
+            /// <summary>
+            /// Exports the texture to <paramref name="path"/>. For texture arrays each slice is
+            /// written as a separate file with a "_slice{N}" suffix inserted before the extension.
+            /// When exporting to .dds the full array is written as a single DX10 DDS with ArrayCount set.
+            /// </summary>
             public void Export(string path)
             {
                 if (path.EndsWith(".dds"))
                 {
                     var dds = new DDS();
-                    dds.MainHeader.Width = this.Width;
+                    dds.MainHeader.Width  = this.Width;
                     dds.MainHeader.Height = this.Height;
-                    dds.MainHeader.Depth = Depth;
+                    dds.MainHeader.Depth  = IsTextureArray ? 1u : (uint)Depth;
                     dds.MainHeader.MipCount = MipCount;
 
-                    dds.ImageData = TextureDataUtil.GetUnalignedData(this, this.GetImageData());
+                    // GetUnalignedData returns slice-major order, which is exactly what DDS expects
+                    var rawData = TextureDataUtil.GetUnalignedData(this, this.GetImageData(), ArrayCount);
+                    dds.ImageData = rawData;
                     dds.MainHeader.PitchOrLinearSize = (uint)dds.ImageData.Length;
 
                     DDS.DXGI_FORMAT format = DDS.DXGI_FORMAT.DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -159,60 +203,67 @@ namespace FinalFantasy16
                     {
                         switch (this.Format)
                         {
-                            case TextureFormat.R8_UNORM:
-                                format = DDS.DXGI_FORMAT.DXGI_FORMAT_R8_UNORM;
-                                break;
-                            case TextureFormat.R8_SNORM:
-                                format = DDS.DXGI_FORMAT.DXGI_FORMAT_R8_SNORM;
-                                break;
-                            case TextureFormat.R32G32B32A32_FLOAT:
-                                format = DDS.DXGI_FORMAT.DXGI_FORMAT_R32G32B32A32_FLOAT;
-                                break;
-                            case TextureFormat.R32G32B32_FLOAT:
-                                format = DDS.DXGI_FORMAT.DXGI_FORMAT_R32G32B32_FLOAT;
-                                break;
-                            case TextureFormat.R32G32_FLOAT:
-                                format = DDS.DXGI_FORMAT.DXGI_FORMAT_R32G32_FLOAT;
-                                break;
-                            case TextureFormat.R32G32_UINT:
-                                format = DDS.DXGI_FORMAT.DXGI_FORMAT_R32G32_UINT;
-                                break;
-                            case TextureFormat.R16G16B16A16_FLOAT:
-                                format = DDS.DXGI_FORMAT.DXGI_FORMAT_R16G16B16A16_FLOAT;
-                                break;
-                            case TextureFormat.R16G16_FLOAT:
-                                format = DDS.DXGI_FORMAT.DXGI_FORMAT_R16G16_FLOAT;
-                                break;
-                            case TextureFormat.R16_FLOAT:
-                                format = DDS.DXGI_FORMAT.DXGI_FORMAT_R16_FLOAT;
-                                break;
-                            case TextureFormat.R10G10B10A2_UNORM:
-                                format = DDS.DXGI_FORMAT.DXGI_FORMAT_R10G10B10A2_UNORM;
-                                break;
+                            case TextureFormat.R8_UNORM:              format = DDS.DXGI_FORMAT.DXGI_FORMAT_R8_UNORM;              break;
+                            case TextureFormat.R8_SNORM:              format = DDS.DXGI_FORMAT.DXGI_FORMAT_R8_SNORM;              break;
+                            case TextureFormat.R32G32B32A32_FLOAT:    format = DDS.DXGI_FORMAT.DXGI_FORMAT_R32G32B32A32_FLOAT;    break;
+                            case TextureFormat.R32G32B32_FLOAT:       format = DDS.DXGI_FORMAT.DXGI_FORMAT_R32G32B32_FLOAT;       break;
+                            case TextureFormat.R32G32_FLOAT:          format = DDS.DXGI_FORMAT.DXGI_FORMAT_R32G32_FLOAT;          break;
+                            case TextureFormat.R32G32_UINT:           format = DDS.DXGI_FORMAT.DXGI_FORMAT_R32G32_UINT;           break;
+                            case TextureFormat.R16G16B16A16_FLOAT:    format = DDS.DXGI_FORMAT.DXGI_FORMAT_R16G16B16A16_FLOAT;    break;
+                            case TextureFormat.R16G16_FLOAT:          format = DDS.DXGI_FORMAT.DXGI_FORMAT_R16G16_FLOAT;          break;
+                            case TextureFormat.R16_FLOAT:             format = DDS.DXGI_FORMAT.DXGI_FORMAT_R16_FLOAT;             break;
+                            case TextureFormat.R10G10B10A2_UNORM:     format = DDS.DXGI_FORMAT.DXGI_FORMAT_R10G10B10A2_UNORM;     break;
                             default:
                                 throw new Exception($"Unsupported rgba format {this.Format}!");
                         }
                     }
 
                     dds.SetFlags(format, false, false);
-                    if (dds.IsDX10)
-                    {
-                        dds.Dx10Header = new DDS.DX10Header();
-                        dds.Dx10Header.ResourceDim = 3;
-                        dds.Dx10Header.ArrayCount = 1;
-                        dds.Dx10Header.DxgiFormat = (uint)format;
-                    }
+                    // Always use DX10 header so ArrayCount can be stored
+                    dds.Dx10Header = new DDS.DX10Header();
+                    dds.Dx10Header.ResourceDim = 3; // D3D10_RESOURCE_DIMENSION_TEXTURE2D
+                    dds.Dx10Header.ArrayCount  = (uint)ArrayCount;
+                    dds.Dx10Header.DxgiFormat  = (uint)format;
                     dds.Save(path);
                 }
                 else
                 {
-                    var data = TextureDataUtil.GetUnalignedData(this, GetImageData());
-                    //rgba convert
                     var formatDecoder = TexFile.FormatList[(int)this.Format];
-                    var rgba = formatDecoder.Decode(data, this.Width, this.Height);
 
-                    var image = Image.LoadPixelData<Rgba32>(rgba, (int)this.Width, (int)this.Height);
-                    image.SaveAsPng(path);
+                    string dir  = Path.GetDirectoryName(path) ?? "";
+                    string name = Path.GetFileNameWithoutExtension(path);
+                    string ext  = Path.GetExtension(path);
+
+                    // GetUnalignedData returns slice-major order:
+                    //   [slice0_mip0][slice0_mip1]...[slice1_mip0][slice1_mip1]...
+                    byte[] unalignedData = TextureDataUtil.GetUnalignedData(this, this.GetImageData(), ArrayCount);
+
+                    // Size of all mips for one slice
+                    int sliceSize = TextureDataUtil.CalculateSliceSize(this);
+                    // mip0 unaligned size for ONE slice
+                    int mip0SliceSize = TextureDataUtil.CalculateUnalignedMipSize(this, 0);
+
+                    for (int arrayIndex = 0; arrayIndex < ArrayCount; arrayIndex++)
+                    {
+                        // Slice-major: each slice's data starts at arrayIndex * sliceSize
+                        int sliceBase = arrayIndex * sliceSize;
+                        byte[] sliceData = new byte[mip0SliceSize];
+                        int copyLen = Math.Min(mip0SliceSize, unalignedData.Length - sliceBase);
+                        if (copyLen > 0)
+                            Array.Copy(unalignedData, sliceBase, sliceData, 0, copyLen);
+
+                        var rgba = formatDecoder.Decode(sliceData, this.Width, this.Height);
+                        var image = Image.LoadPixelData<Rgba32>(rgba, (int)this.Width, (int)this.Height);
+
+                        string outputPath = ArrayCount > 1
+                            ? Path.Combine(dir, $"{name}_slice{arrayIndex}{ext}")
+                            : path;
+
+                        image.SaveAsPng(outputPath);
+                        image.Dispose();
+
+                        Console.WriteLine($"Exported array slice {arrayIndex} -> {outputPath}");
+                    }
                 }
             }
 
@@ -221,10 +272,21 @@ namespace FinalFantasy16
                 if (path.EndsWith(".dds"))
                 {
                     var dds = new DDS(path);
-                    this.Width = (ushort)dds.MainHeader.Width;
-                    this.Height = (ushort)dds.MainHeader.Height;
-                    this.Depth = (ushort)dds.MainHeader.Depth;
+                    this.Width    = (ushort)dds.MainHeader.Width;
+                    this.Height   = (ushort)dds.MainHeader.Height;
                     this.MipCount = (ushort)dds.MainHeader.MipCount;
+
+                    // Detect texture array from DX10 header
+                    int newArrayCount = 1;
+                    if (dds.IsDX10 && dds.Dx10Header.ArrayCount > 1)
+                    {
+                        newArrayCount = (int)dds.Dx10Header.ArrayCount;
+                        this.Depth = (ushort)newArrayCount;
+                    }
+                    else
+                    {
+                        this.Depth = 1;
+                    }
 
                     var encoder = DDS.FormatList[(int)dds.Format];
                     if (!FormatList.Any(x => x.Value.ToString() == encoder.ToString()))
@@ -232,30 +294,28 @@ namespace FinalFantasy16
 
                     this.Format = (TextureFormat)FormatList.FirstOrDefault(X => X.Value.ToString() == encoder.ToString()).Key;
 
-                    SetImageData(TextureDataUtil.GetAlignedData(this, dds.ImageData));
+                    // DDS data is already in slice-major order; align directly
+                    SetImageData(TextureDataUtil.GetAlignedData(this, dds.ImageData, newArrayCount));
                 }
                 else
                 {
                     var image = Image.Load<Rgba32>(path);
-                    this.Width = (ushort)image.Width;
+                    this.Width  = (ushort)image.Width;
                     this.Height = (ushort)image.Height;
                     var mipCount = (ushort)CalculateMipCount();
-                    //Use original mip count unless computed is too low
                     if (this.MipCount < mipCount && MipCount != 1)
                         this.MipCount = mipCount;
 
                     var mipmaps = ImageSharpTextureHelper.GenerateMipmaps(image, this.MipCount);
 
-                    //padding for rgba
                     List<byte[]> encoded_mips = new List<byte[]>();
                     for (int i = 0; i < MipCount; i++)
                     {
                         var imageMipmap = mipmaps[i];
                         var rgba = imageMipmap.GetSourceInBytes();
-                        var mipWidth  = (uint)TextureDataUtil.CalculateMipDimension(this.Width, i);
+                        var mipWidth  = (uint)TextureDataUtil.CalculateMipDimension(this.Width,  i);
                         var mipHeight = (uint)TextureDataUtil.CalculateMipDimension(this.Height, i);
 
-                        //rgba convert
                         var formatEncoder = TexFile.FormatList[(int)this.Format];
                         var encoded = formatEncoder.Encode(rgba, mipWidth, mipHeight);
                         encoded_mips.Add(encoded);
@@ -491,9 +551,11 @@ namespace FinalFantasy16
         public static Dictionary<int, ImageEncoder> FormatList = new Dictionary<int, ImageEncoder>()
         {
             { (int)TextureFormat.R8G8B8A8_UNORM, ImageFormats.Rgba8() },
+            { (int)TextureFormat.R8G8B8A8_UNORM_SRGB, ImageFormats.Rgba8() },
             { (int)TextureFormat.R8G8_UNORM, ImageFormats.Rg8() },
             { (int)TextureFormat.R8_UNORM, ImageFormats.R8() },
             { (int)TextureFormat.R32G32B32A32_FLOAT, ImageFormats.Rgba32() },
+            { (int)TextureFormat.R32G32B32_FLOAT, new Rgba(32, 32, 32) },
             { (int)TextureFormat.R32G32_FLOAT, ImageFormats.Rg32() },
             { (int)TextureFormat.R32G32_UINT, ImageFormats.Rg32() },
             { (int)TextureFormat.R32_FLOAT, ImageFormats.R32() },

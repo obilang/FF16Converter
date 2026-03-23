@@ -31,9 +31,21 @@ namespace FF16Converter
 
                     TexFile texFile = new TexFile(File.OpenRead(arg));
                     foreach (var tex in texFile.Textures)
-                        tex.Export(arg + ext);
+                    {
+                        if (tex.IsTextureArray)
+                            Console.WriteLine($"Texture2DArray detected: {tex.ArrayCount} slices ({tex.Width}x{tex.Height})");
 
-                    //texFile.Save("testRB.tex");
+                        if (ext == ".dds")
+                        {
+                            // Export entire array as a single DX10 DDS
+                            tex.Export(arg + ext);
+                        }
+                        else
+                        {
+                            // Export each slice as a separate PNG
+                            tex.Export(arg + ext);
+                        }
+                    }
                 }
                 else if (arg.EndsWith(".png") ||
                          arg.EndsWith(".dds") ||

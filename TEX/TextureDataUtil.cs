@@ -12,8 +12,9 @@ namespace FF16Converter
     public class TextureDataUtil
     {
         public const uint D3D12_TEXTURE_DATA_PITCH_ALIGNMENT = 256;
+        public const uint D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT = 512;
 
-        private static uint Align(uint value, uint alignment)
+        internal static uint Align(uint value, uint alignment)
         {
             return (value + (alignment - 1)) & ~(alignment - 1);
         }
@@ -27,237 +28,389 @@ namespace FF16Converter
         }
 
         /// <summary>
-        /// Calculates the full texture surface data, mipmaps included, with padding added for row alignment calculations
+        /// Returns the aligned byte size of a single mip level for ONE array slice.
+        /// Uses D3D12 row pitch alignment (256 bytes) only - no additional placement alignment.
         /// </summary>
-        public static byte[] CalculateSurfacePadding(TexFile.Texture tex, byte[] data)
+        public static int CalculateAlignedMipSize(TexFile.Texture tex, int mipLevel)
         {
-            List<byte[]> mipmaps = new List<byte[]>();
-            int ofs = 0;
+            var mipWidth  = CalculateMipDimension(tex.Width,  mipLevel);
+            var mipHeight = CalculateMipDimension(tex.Height, mipLevel);
+            CalculateFormatSize(tex.Format, mipWidth, mipHeight, out _, out int slice, out int alignedSlice);
+            return alignedSlice;
+        }
+
+        /// <summary>
+        /// Returns the unaligned byte size of a single mip level for ONE array slice.
+        /// </summary>
+        public static int CalculateUnalignedMipSize(TexFile.Texture tex, int mipLevel)
+        {
+            var mipWidth  = CalculateMipDimension(tex.Width,  mipLevel);
+            var mipHeight = CalculateMipDimension(tex.Height, mipLevel);
+            CalculateFormatSize(tex.Format, mipWidth, mipHeight, out _, out int slice, out int alignedSlice);
+            return slice;
+        }
+
+        /// <summary>
+        /// Returns the raw byte size of a single array slice (all mips) without alignment.
+        /// </summary>
+        public static int CalculateSliceSize(TexFile.Texture tex)
+        {
+            int total = 0;
             for (int mipLevel = 0; mipLevel < tex.MipCount; mipLevel++)
-            {
-                var mipWidth = CalculateMipDimension(tex.Width, mipLevel);
-                var mipHeight = CalculateMipDimension(tex.Height, mipLevel);
-
-                CalculateFormatSize(tex.Format, mipWidth, mipHeight, out int pitch, out int slice, out int alignedSlice);
-
-                int aligned_size = alignedSlice;
-                if (mipLevel == tex.MipCount - 1 && tex.MipCount > 1) //last mip
-                    aligned_size = slice;
-
-                byte[] buffer = new byte[aligned_size];
-                data.AsSpan().Slice(ofs, (int)aligned_size).CopyTo(buffer);
-                mipmaps.Add(buffer);
-
-                ofs += (int)aligned_size;
-            }
-
-            return ByteUtil.CombineByteArray(mipmaps.ToArray());
+                total += CalculateUnalignedMipSize(tex, mipLevel);
+            return total;
         }
 
         /// <summary>
-        /// Aligns the image surface based on the tex file alignment parameters.
-        /// Returns a list of mipmaps.
+        /// Calculates the full texture surface data with alignment, in slice-major order.
+        /// FF16 Texture2DArray on-disk layout:
+        ///   [slice0_mip0_aligned][slice0_mip1_aligned]...[slice1_mip0_aligned][slice1_mip1_aligned]...
+        /// For non-arrays: [mip0_aligned][mip1_aligned]...
+        /// This function is a pass-through; the raw chunk data is already in the correct aligned layout.
         /// </summary>
-        public static List<byte[]> GetAlignedData(TexFile.Texture tex, byte[] data)
+        public static byte[] CalculateSurfacePadding(TexFile.Texture tex, byte[] data, int arrayCount = 1)
         {
-            var formatDecoder = TexFile.FormatList[(int)tex.Format];
-            if (formatDecoder is Bcn)
-                return GetCompressedAlignedData(tex, data);
-            else //uncompressed
-                return GetUncompressedAlignedData(tex, data);
+            return data;
         }
-
 
         /// <summary>
-        /// Removes alignment of the image data, storing data in the expected row sizes for DDS usage.
+        /// Aligns image data from slice-major unaligned input to slice-major aligned output.
+        /// Returns one byte[] per subresource: [slice0_mip0, slice0_mip1, ..., slice1_mip0, ...]
         /// </summary>
-        public static byte[] GetUnalignedData(TexFile.Texture tex, byte[] data)
+        public static List<byte[]> GetAlignedData(TexFile.Texture tex, byte[] data, int arrayCount = 1)
         {
             var formatDecoder = TexFile.FormatList[(int)tex.Format];
             if (formatDecoder is Bcn)
-                return GetCompressedUnalignedData(tex, data);
-            else //uncompressed
-                return GetUncompressedUnalignedData(tex, data);
+                return GetCompressedAlignedData(tex, data, arrayCount);
+            else
+                return GetUncompressedAlignedData(tex, data, arrayCount);
         }
 
-        private static byte[] GetCompressedUnalignedData(TexFile.Texture tex, byte[] data)
+        /// <summary>
+        /// Removes D3D12 row pitch alignment from image data.
+        /// On-disk layout is SLICE-MAJOR:
+        ///   [slice0_mip0_aligned][slice0_mip1_aligned]...[slice1_mip0_aligned][slice1_mip1_aligned]...
+        /// Returns unaligned data in the same SLICE-MAJOR order.
+        /// </summary>
+        public static byte[] GetUnalignedData(TexFile.Texture tex, byte[] data, int arrayCount = 1)
+        {
+            var formatDecoder = TexFile.FormatList[(int)tex.Format];
+            if (formatDecoder is Bcn)
+                return GetCompressedUnalignedData(tex, data, arrayCount);
+            else
+                return GetUncompressedUnalignedData(tex, data, arrayCount);
+        }
+
+        // -----------------------------------------------------------------------
+        //  Unaligned extraction — SLICE-MAJOR layout
+        //  Input:  [slice0_mip0_aligned][slice0_mip1_aligned]...[slice1_mip0_aligned]...
+        //  Output: [slice0_mip0][slice0_mip1]...[slice1_mip0]... (row padding stripped)
+        // -----------------------------------------------------------------------
+
+        private static byte[] GetCompressedUnalignedData(TexFile.Texture tex, byte[] data, int arrayCount)
         {
             var formatDecoder = (Bcn)TexFile.FormatList[(int)tex.Format];
-            // Write compressed data
             bool isSingle = formatDecoder.Format == BcnFormats.BC1 || formatDecoder.Format == BcnFormats.BC4;
-            int blockSize = isSingle ? 8 : 16;
-            int mipOffset = 0;
+            int blockSize  = isSingle ? 8 : 16;
+
+            // Pre-compute aligned mip sizes for one slice
+            int[] alignedMipSizes = new int[tex.MipCount];
+            for (int m = 0; m < tex.MipCount; m++)
+            {
+                var mw = CalculateMipDimension(tex.Width,  m);
+                var mh = CalculateMipDimension(tex.Height, m);
+                int bW = (mw + 3) / 4;
+                int bH = (mh + 3) / 4;
+                int row = bW * blockSize;
+                int alignedRow = (int)Align((uint)row, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
+                alignedMipSizes[m] = (int)Align((uint)(alignedRow * bH), D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
+            }
 
             var mem = new MemoryStream();
             using (var wr = new BinaryWriter(mem))
+            {
+                int dataOffset = 0;
+
+                for (int arrayIndex = 0; arrayIndex < arrayCount; arrayIndex++)
+                {
+                    for (int mipLevel = 0; mipLevel < tex.MipCount; mipLevel++)
+                    {
+                        var mipWidth  = CalculateMipDimension(tex.Width,  mipLevel);
+                        var mipHeight = CalculateMipDimension(tex.Height, mipLevel);
+                        int blocksW   = (mipWidth  + 3) / 4;
+                        int blocksH   = (mipHeight + 3) / 4;
+                        int origRow   = blocksW * blockSize;
+                        int alignedRow = (int)Align((uint)origRow, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
+
+                        for (int row = 0; row < blocksH; row++)
+                        {
+                            int rowStart = dataOffset + row * alignedRow;
+                            wr.Write(data, rowStart, origRow);
+                        }
+
+                        dataOffset += alignedMipSizes[mipLevel];
+                    }
+                }
+            }
+            return mem.ToArray();
+        }
+
+        private static byte[] GetUncompressedUnalignedData(TexFile.Texture tex, byte[] data, int arrayCount)
+        {
+            var formatDecoder  = (Rgba)TexFile.FormatList[(int)tex.Format];
+            var bitsPerPixel   = (uint)(formatDecoder.R + formatDecoder.G + formatDecoder.B + formatDecoder.A);
+            int bytesPerPixel  = (int)(bitsPerPixel + 7) / 8;
+
+            // Pre-compute aligned mip sizes for one slice
+            int[] alignedMipSizes = new int[tex.MipCount];
+            for (int m = 0; m < tex.MipCount; m++)
+            {
+                var mw = CalculateMipDimension(tex.Width,  m);
+                var mh = CalculateMipDimension(tex.Height, m);
+                int row = mw * bytesPerPixel;
+                int alignedRow = (int)Align((uint)row, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
+                alignedMipSizes[m] = (int)Align((uint)(alignedRow * mh), D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
+            }
+
+            var mem = new MemoryStream();
+            using (var wr = new BinaryWriter(mem))
+            {
+                int dataOffset = 0;
+
+                for (int arrayIndex = 0; arrayIndex < arrayCount; arrayIndex++)
+                {
+                    for (int mipLevel = 0; mipLevel < tex.MipCount; mipLevel++)
+                    {
+                        var mipWidth  = CalculateMipDimension(tex.Width,  mipLevel);
+                        var mipHeight = CalculateMipDimension(tex.Height, mipLevel);
+                        int origRow   = mipWidth * bytesPerPixel;
+                        int alignedRow = (int)Align((uint)origRow, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
+
+                        for (int row = 0; row < mipHeight; row++)
+                        {
+                            int rowStart = dataOffset + row * alignedRow;
+                            wr.Write(data, rowStart, origRow);
+                        }
+
+                        dataOffset += alignedMipSizes[mipLevel];
+                    }
+                }
+            }
+            return mem.ToArray();
+        }
+
+        // -----------------------------------------------------------------------
+        //  Aligned data creation — SLICE-MAJOR layout
+        //  Input:  unaligned slice-major [slice0_mip0][slice0_mip1]...[slice1_mip0]...
+        //  Output: one byte[] per subresource (slice-major order) with row padding added
+        // -----------------------------------------------------------------------
+
+        private static List<byte[]> GetCompressedAlignedData(TexFile.Texture tex, byte[] data, int arrayCount)
+        {
+            var formatDecoder = (Bcn)TexFile.FormatList[(int)tex.Format];
+            bool isSingle = formatDecoder.Format == BcnFormats.BC1 || formatDecoder.Format == BcnFormats.BC4;
+            int blockSize  = isSingle ? 8 : 16;
+
+            int[] unalignedMipSizes = new int[tex.MipCount];
+            for (int i = 0; i < tex.MipCount; i++)
+            {
+                var w = CalculateMipDimension(tex.Width,  i);
+                var h = CalculateMipDimension(tex.Height, i);
+                int bW = (w + 3) / 4;
+                int bH = (h + 3) / 4;
+                unalignedMipSizes[i] = bW * blockSize * bH;
+            }
+
+            List<byte[]> result = new List<byte[]>();
+            int dataOffset = 0;
+
+            for (int arrayIndex = 0; arrayIndex < arrayCount; arrayIndex++)
             {
                 for (int mipLevel = 0; mipLevel < tex.MipCount; mipLevel++)
                 {
-                    var mipWidth = CalculateMipDimension(tex.Width, mipLevel);
-                    var mipHeight = CalculateMipDimension(tex.Height, mipLevel);
+                    var mipWidth   = CalculateMipDimension(tex.Width,  mipLevel);
+                    var mipHeight  = CalculateMipDimension(tex.Height, mipLevel);
+                    int blocksW    = (mipWidth  + 3) / 4;
+                    int blocksH    = (mipHeight + 3) / 4;
+                    int origRow    = blocksW * blockSize;
+                    int alignedRow = (int)Align((uint)origRow, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
+                    int alignedMipSize = (int)Align((uint)(alignedRow * blocksH), D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
+                    int unalignedMip = unalignedMipSizes[mipLevel];
 
-                    //width/height for compressed block types
-                    var blocksWidth = (mipWidth + 3) / 4;
-                    var blocksHeight = (mipHeight + 3) / 4;
-
-                    int alignedRowSize = (int)Align((uint)(blocksWidth * blockSize), D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
-                    int originalRowSize = blocksWidth * blockSize;
-                    int totalAlignedSize = alignedRowSize * blocksHeight;
-
-                    Console.WriteLine($"{mipLevel} {mipWidth}x{mipHeight} {alignedRowSize} {blocksWidth * blocksHeight * blockSize}");
-
-                    for (int row = 0; row < blocksHeight; row++)
+                    byte[] alignedData = new byte[alignedMipSize];
+                    for (int row = 0; row < blocksH; row++)
                     {
-                        int alignedRowStart = mipOffset + (row * alignedRowSize);
-
-                        byte[] alignedRowData = data.Skip(alignedRowStart).Take(alignedRowSize).ToArray();
-                        wr.Write(alignedRowData, 0, originalRowSize);
+                        int src = dataOffset + row * origRow;
+                        int dst = row * alignedRow;
+                        Array.Copy(data, src, alignedData, dst, origRow);
                     }
-                    mipOffset += totalAlignedSize;
+                    result.Add(alignedData);
+
+                    dataOffset += unalignedMip;
                 }
             }
-            return mem.ToArray();
+            return result;
         }
 
-        private static byte[] GetUncompressedUnalignedData(TexFile.Texture tex, byte[] data)
+        private static List<byte[]> GetUncompressedAlignedData(TexFile.Texture tex, byte[] data, int arrayCount)
         {
-            var formatDecoder = (Rgba)TexFile.FormatList[(int)tex.Format];
-            var bitsPerPixel = (uint)(formatDecoder.R + formatDecoder.G + formatDecoder.B + formatDecoder.A);
-            int bytesPerPixel = (int)(bitsPerPixel + 7) / 8;
+            var formatDecoder  = (Rgba)TexFile.FormatList[(int)tex.Format];
+            var bitsPerPixel   = (uint)(formatDecoder.R + formatDecoder.G + formatDecoder.B + formatDecoder.A);
+            int bytesPerPixel  = (int)(bitsPerPixel + 7) / 8;
 
-            int mipOffset = 0;
-            var mem = new MemoryStream();
-            using (var wr = new BinaryWriter(mem))
+            List<byte[]> result = new List<byte[]>();
+            int dataOffset = 0;
+
+            for (int arrayIndex = 0; arrayIndex < arrayCount; arrayIndex++)
             {
-                for (int i = 0; i < tex.MipCount; i++)
+                for (int mipLevel = 0; mipLevel < tex.MipCount; mipLevel++)
                 {
-                    var mipWidth = CalculateMipDimension(tex.Width, i);
-                    var mipHeight = CalculateMipDimension(tex.Height, i);
-                    int alignedRowSize = (int)Align((uint)(mipWidth * bytesPerPixel), D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
-                    int originalRowSize = mipWidth * bytesPerPixel; // Expected data row size
+                    var mipWidth   = CalculateMipDimension(tex.Width,  mipLevel);
+                    var mipHeight  = CalculateMipDimension(tex.Height, mipLevel);
+                    int origRow    = mipWidth * bytesPerPixel;
+                    int alignedRow = (int)Align((uint)origRow, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
+                    int alignedMipSize = (int)Align((uint)(alignedRow * mipHeight), D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
+                    int unalignedMip = origRow * mipHeight;
 
-                    for (int y = 0; y < mipHeight; y++)
+                    byte[] alignedData = new byte[alignedMipSize];
+                    for (int row = 0; row < mipHeight; row++)
                     {
-                        int rowStart = y * alignedRowSize;
-                        byte[] alignedRowData = data.Skip(mipOffset + rowStart).Take(alignedRowSize).ToArray();
-
-                        // Write only the original width's worth of pixels (ignore the padding)
-                        wr.Write(alignedRowData, 0, originalRowSize);
+                        int src = dataOffset + row * origRow;
+                        int dst = row * alignedRow;
+                        Array.Copy(data, src, alignedData, dst, origRow);
                     }
+                    result.Add(alignedData);
 
-                    mipOffset += alignedRowSize * mipHeight;
+                    dataOffset += unalignedMip;
                 }
             }
-            return mem.ToArray();
+            return result;
         }
 
-        private static List<byte[]> GetCompressedAlignedData(TexFile.Texture tex, byte[] data)
+        // -----------------------------------------------------------------------
+
+        /// <summary>
+        /// Converts unaligned subresource data from mip-major order
+        ///   [mip0_slice0][mip0_slice1]...[mip1_slice0][mip1_slice1]...
+        /// to slice-major (DDS) order
+        ///   [slice0_mip0][slice0_mip1]...[slice1_mip0][slice1_mip1]...
+        /// </summary>
+        public static byte[] MipMajorToSliceMajor(TexFile.Texture tex, byte[] data, int arrayCount)
         {
-            var formatDecoder = (Bcn)TexFile.FormatList[(int)tex.Format];
-            // Write compressed data
-            bool isSingle = formatDecoder.Format == BcnFormats.BC1 || formatDecoder.Format == BcnFormats.BC4;
-            int blockSize = isSingle ? 8 : 16;
+            if (arrayCount <= 1 || tex.MipCount <= 1)
+                return data;
 
-            int mipOffset = 0;
+            // Pre-compute unaligned mip sizes for one slice
+            int[] mipSizes = new int[tex.MipCount];
+            for (int m = 0; m < tex.MipCount; m++)
+                mipSizes[m] = CalculateUnalignedMipSize(tex, m);
 
-            List<byte[]> mipmaps = new List<byte[]>();
-            for (int i = 0; i < tex.MipCount; i++)
+            byte[] result = new byte[data.Length];
+
+            // Build source offset table: mip-major
+            // srcOffsets[mip][slice] = offset in 'data'
+            int srcOff = 0;
+            int[][] srcOffsets = new int[tex.MipCount][];
+            for (int m = 0; m < tex.MipCount; m++)
             {
-                var mipWidth = CalculateMipDimension(tex.Width, i);
-                var mipHeight = CalculateMipDimension(tex.Height, i);
-
-                // Calculate aligned width and height in blocks
-                int blockWidth = (mipWidth + 3) / 4;
-                int blockHeight = (mipHeight + 3) / 4;
-
-                int alignedRowSize = (int)Align((uint)(blockWidth * blockSize), D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
-                int totalAlignedSize = alignedRowSize * blockHeight;
-
-                byte[] alignedData = new byte[totalAlignedSize];
-
-                for (int y = 0; y < mipHeight; y += 4)
+                srcOffsets[m] = new int[arrayCount];
+                for (int s = 0; s < arrayCount; s++)
                 {
-                    int originalRowSize = blockWidth * blockSize;
-                    int rowStart = (y / 4) * originalRowSize;
-                    byte[] originalRowData = data.Skip(mipOffset + rowStart).Take(originalRowSize).ToArray();
-
-                    int alignedRowStart = (y / 4) * alignedRowSize;
-                    // Transfer data to aligned row
-                    Array.Copy(originalRowData, 0, alignedData, alignedRowStart, originalRowSize);
+                    srcOffsets[m][s] = srcOff;
+                    srcOff += mipSizes[m];
                 }
-
-                mipmaps.Add(alignedData);
-
-                // Update the mip offset to move to the next mip level
-                mipOffset += (mipWidth / 4) * blockSize * blockHeight;
             }
-            return mipmaps;
+
+            // Write in slice-major order
+            int dstOff = 0;
+            for (int s = 0; s < arrayCount; s++)
+            {
+                for (int m = 0; m < tex.MipCount; m++)
+                {
+                    int size = mipSizes[m];
+                    int copyLen = Math.Min(size, data.Length - srcOffsets[m][s]);
+                    if (copyLen > 0)
+                        Array.Copy(data, srcOffsets[m][s], result, dstOff, copyLen);
+                    dstOff += size;
+                }
+            }
+
+            return result;
         }
 
-        private static List<byte[]> GetUncompressedAlignedData(TexFile.Texture tex, byte[] data)
+        /// <summary>
+        /// Converts unaligned subresource data from slice-major (DDS) order
+        ///   [slice0_mip0][slice0_mip1]...[slice1_mip0][slice1_mip1]...
+        /// to mip-major order
+        ///   [mip0_slice0][mip0_slice1]...[mip1_slice0][mip1_slice1]...
+        /// </summary>
+        public static byte[] SliceMajorToMipMajor(TexFile.Texture tex, byte[] data, int arrayCount)
         {
-            var formatDecoder = (Rgba)TexFile.FormatList[(int)tex.Format];
-            var bitsPerPixel = (uint)(formatDecoder.R + formatDecoder.G + formatDecoder.B + formatDecoder.A);
-            int bytesPerPixel = (int)(bitsPerPixel + 7) / 8;
+            if (arrayCount <= 1 || tex.MipCount <= 1)
+                return data;
 
-            List<byte[]> mipmaps = new List<byte[]>();
-            int mipOffset = 0;
-            for (int i = 0; i < tex.MipCount; i++)
+            // Pre-compute unaligned mip sizes for one slice
+            int[] mipSizes = new int[tex.MipCount];
+            for (int m = 0; m < tex.MipCount; m++)
+                mipSizes[m] = CalculateUnalignedMipSize(tex, m);
+
+            byte[] result = new byte[data.Length];
+
+            // Build source offset table: slice-major
+            // srcOffsets[slice][mip] = offset in 'data'
+            int srcOff = 0;
+            int[][] srcOffsets = new int[arrayCount][];
+            for (int s = 0; s < arrayCount; s++)
             {
-                var mipWidth = CalculateMipDimension(tex.Width, i);
-                var mipHeight = CalculateMipDimension(tex.Height, i);
-
-                int alignedRowSize = (int)Align((uint)(mipWidth * bytesPerPixel), D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
-
-                int totalAlignedSize = alignedRowSize * mipHeight;
-                byte[] alignedData = new byte[totalAlignedSize];
-
-                for (int y = 0; y < mipHeight; y++)
+                srcOffsets[s] = new int[tex.MipCount];
+                for (int m = 0; m < tex.MipCount; m++)
                 {
-                    int originalRowSize = mipWidth * (int)bytesPerPixel;
-                    int rowStart = y * originalRowSize;
-                    byte[] originalRowData = data.Skip(mipOffset + rowStart).Take(originalRowSize).ToArray();
-
-                    int alignedRowStart = y * alignedRowSize;
-                    //Transfer data to aligned row
-                    Array.Copy(originalRowData, 0, alignedData, alignedRowStart, originalRowSize);
+                    srcOffsets[s][m] = srcOff;
+                    srcOff += mipSizes[m];
                 }
-                mipmaps.Add(alignedData);
-
-                mipOffset += mipWidth * mipHeight * bytesPerPixel;
             }
-            return mipmaps;
+
+            // Write in mip-major order
+            int dstOff = 0;
+            for (int m = 0; m < tex.MipCount; m++)
+            {
+                for (int s = 0; s < arrayCount; s++)
+                {
+                    int size = mipSizes[m];
+                    int copyLen = Math.Min(size, data.Length - srcOffsets[s][m]);
+                    if (copyLen > 0)
+                        Array.Copy(data, srcOffsets[s][m], result, dstOff, copyLen);
+                    dstOff += size;
+                }
+            }
+
+            return result;
         }
+
+        // -----------------------------------------------------------------------
 
         static int GetBPP(TexFile.TextureFormat format)
         {
             switch (format)
             {
-                case TexFile.TextureFormat.R32G32B32A32_FLOAT:
-                    return 32;
-                case TexFile.TextureFormat.R32G32B32_FLOAT:
-                    return 24;
-                case TexFile.TextureFormat.R32G32_FLOAT:
-                    return 16;
+                case TexFile.TextureFormat.R32G32B32A32_FLOAT: return 32;
+                case TexFile.TextureFormat.R32G32B32_FLOAT:    return 24;
+                case TexFile.TextureFormat.R32G32_FLOAT:       return 16;
                 case TexFile.TextureFormat.R8G8_UNORM:
                 case TexFile.TextureFormat.R8G8_SNORM:
                 case TexFile.TextureFormat.R8G8_SINT:
-                case TexFile.TextureFormat.R8G8_UINT:
-                    return 2;
+                case TexFile.TextureFormat.R8G8_UINT:          return 2;
                 case TexFile.TextureFormat.R8_UNORM:
                 case TexFile.TextureFormat.R8_SNORM:
                 case TexFile.TextureFormat.R8_SINT:
-                case TexFile.TextureFormat.R8_UINT:
-                    return 1;
+                case TexFile.TextureFormat.R8_UINT:            return 1;
                 case TexFile.TextureFormat.R32_FLOAT:
-                case TexFile.TextureFormat.R8G8B8A8_UNORM:
-                    return 4;
-                default:
-                    return 4;
+                case TexFile.TextureFormat.R8G8B8A8_UNORM:     return 4;
+                default:                                        return 4;
             }
         }
 
-        static void CalculateFormatSize(TexFile.TextureFormat format, int width, int height,
+        public static void CalculateFormatSize(TexFile.TextureFormat format, int width, int height,
              out int pitch, out int slice, out int alignedSlice)
         {
             switch (format)
@@ -267,12 +420,11 @@ namespace FF16Converter
                 case TexFile.TextureFormat.BC4_UNORM:
                 case TexFile.TextureFormat.BC4_SNORM:
                     {
-                        int blockWidth = (width + 3) / 4;
+                        int blockWidth  = (width  + 3) / 4;
                         int blockHeight = (height + 3) / 4;
-                        //width * bytes per pixel (8)
-                        pitch = blockWidth * 8;
-                        slice = pitch * blockHeight;
-                        alignedSlice = (int)Align((uint)pitch, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT) * blockHeight;
+                        pitch        = blockWidth * 8;
+                        slice        = pitch * blockHeight;
+                        alignedSlice = (int)Align((uint)(Align((uint)pitch, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT) * blockHeight), D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
                         break;
                     }
                 case TexFile.TextureFormat.BC2_UNORM:
@@ -286,19 +438,18 @@ namespace FF16Converter
                 case TexFile.TextureFormat.BC7_UNORM:
                 case TexFile.TextureFormat.BC7_UNORM_SRGB:
                     {
-                        int blockWidth = (width + 3) / 4;
+                        int blockWidth  = (width  + 3) / 4;
                         int blockHeight = (height + 3) / 4;
-                        //width * bytes per pixel (16)
-                        pitch = blockWidth * 16;
-                        slice = pitch * blockHeight;
-                        alignedSlice = (int)Align((uint)pitch, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT) * blockHeight;
+                        pitch        = blockWidth * 16;
+                        slice        = pitch * blockHeight;
+                        alignedSlice = (int)Align((uint)(Align((uint)pitch, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT) * blockHeight), D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
                         break;
                     }
                 default:
                     {
-                        pitch = ((width) * GetBPP(format) + 7) / 8;
-                        slice = pitch * height;
-                        alignedSlice = (int)Align((uint)pitch, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT) * height;
+                        pitch        = ((width) * GetBPP(format) + 7) / 8;
+                        slice        = pitch * height;
+                        alignedSlice = (int)Align((uint)(Align((uint)pitch, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT) * height), D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
                         break;
                     }
             }
